@@ -4,6 +4,8 @@ import logging
 from typing import Union, Sequence
 import asyncio
 import json
+import os
+import yaml
 
 import voluptuous as vol
 
@@ -46,6 +48,9 @@ CONF_TRACKED_EVENT_TYPE = 'tracked_event_type'
 CONF_ATTRIBUTES = 'attributes'
 CONF_UNIQUE_ID = 'unique_id'
 ATTR_VALUE = 'value'
+OBJECT_ID = 'object_id'
+
+CONF_FILE_PATH = 'file_path'
 
 def validate_event_types(value: Union[str, Sequence]) -> Sequence[str]:
     """Validate event types."""
@@ -82,44 +87,62 @@ SERVICE_SET_SCHEMA = make_entity_service_schema({
         vol.Optional(CONF_TRACKED_EVENT_TYPE): validate_event_types,
 })
 
+SERVICE_ADD = "add"
+SERVICE_ADD_SCHEMA = vol.Schema({
+    vol.Required('object_id'): cv.string,
+    vol.Optional(CONF_INITIAL_VALUE): cv.match_all,
+    vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
+    vol.Optional(CONF_ATTRIBUTES): vol.Schema({cv.string: cv.template}),
+    vol.Optional(CONF_QUERY): vol.All(cv.string, validate_sql_select),
+    vol.Optional(CONF_COLUMN): cv.string,
+    vol.Optional(ATTR_UNIT_OF_MEASUREMENT): cv.string,
+    vol.Optional(CONF_RESTORE): cv.boolean,
+    vol.Optional(CONF_FORCE_UPDATE): cv.boolean,
+    vol.Optional(CONF_UNIQUE_ID): cv.string,
+    vol.Optional(ATTR_FRIENDLY_NAME): cv.string,
+    vol.Optional(CONF_FRIENDLY_NAME_TEMPLATE): cv.template,
+    vol.Optional(CONF_ICON): cv.icon,
+    vol.Optional(CONF_ICON_TEMPLATE): cv.template,
+    vol.Optional(ATTR_ENTITY_PICTURE): cv.string,
+    vol.Optional(CONF_ENTITY_PICTURE_TEMPLATE): cv.template,
+    vol.Optional(CONF_TRACKED_ENTITY_ID): cv.entity_ids,
+    vol.Optional(CONF_TRACKED_EVENT_TYPE): validate_event_types,
+})
+
 SERVICE_UPDATE = "update"
 SERVICE_UPDATE_SCHEMA = make_entity_service_schema({})
 
 CONFIG_SCHEMA = vol.Schema({
     DOMAIN: vol.Schema({
-        cv.slug: vol.Any({
-            vol.Optional(CONF_INITIAL_VALUE): cv.match_all,
-            vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
-            vol.Optional(CONF_ATTRIBUTES): vol.Schema({cv.string: cv.template}),
-            vol.Optional(CONF_QUERY): vol.All(cv.string, validate_sql_select),
-            vol.Optional(CONF_COLUMN): cv.string,
-            vol.Optional(ATTR_UNIT_OF_MEASUREMENT): cv.string,
-            vol.Optional(CONF_RESTORE): cv.boolean,
-            vol.Optional(CONF_FORCE_UPDATE): cv.boolean,
-            vol.Optional(CONF_UNIQUE_ID): cv.string,
-            vol.Optional(ATTR_FRIENDLY_NAME): cv.string,
-            vol.Optional(CONF_FRIENDLY_NAME_TEMPLATE): cv.template,
-            vol.Optional(CONF_ICON): cv.icon,
-            vol.Optional(CONF_ICON_TEMPLATE): cv.template,
-            vol.Optional(ATTR_ENTITY_PICTURE): cv.string,
-            vol.Optional(CONF_ENTITY_PICTURE_TEMPLATE): cv.template,
-            vol.Optional(CONF_TRACKED_ENTITY_ID): cv.entity_ids,
-            vol.Optional(CONF_TRACKED_EVENT_TYPE): validate_event_types,
-        }, None)
+        vol.Required(CONF_FILE_PATH): cv.string,
     })
 }, extra=vol.ALLOW_EXTRA)
 
 async def async_setup(hass, config):
     """Set up variables from config."""
     component = EntityComponent(_LOGGER, DOMAIN, hass)
+    config_file_path = None
+    if CONF_FILE_PATH in config[DOMAIN]:
+        add_enabled = True
+        config_file_path = config[DOMAIN][CONF_FILE_PATH]
+        var_config = await _load_yaml(config_file_path)
+    else:
+        add_enabled = False
+        var_config = config[DOMAIN]
 
-    if not await _load_from_config(hass, config, component):
+    if not await _load_from_config(hass, var_config, component):
         return False
 
     component.async_register_entity_service(
         SERVICE_SET, SERVICE_SET_SCHEMA,
         'async_set'
     )
+
+    if add_enabled:
+        component.async_register_entity_service(
+            SERVICE_ADD, SERVICE_ADD_SCHEMA,
+            'async_add'
+        )
 
     component.async_register_entity_service(
         SERVICE_UPDATE, SERVICE_UPDATE_SCHEMA,
@@ -141,12 +164,88 @@ async def async_setup(hass, config):
         reload_service_handler
     )
 
+    async def handle_add_variable(call):
+        object_id = call.data['object_id']
+        initial_value = call.data.get(CONF_INITIAL_VALUE)
+        value_template = call.data.get(CONF_VALUE_TEMPLATE)
+        attributes = call.data.get(CONF_ATTRIBUTES, {})
+        query = call.data.get(CONF_QUERY)
+        column = call.data.get(CONF_COLUMN)
+        unit = call.data.get(ATTR_UNIT_OF_MEASUREMENT)
+        restore = call.data.get(CONF_RESTORE, True)
+        force_update = call.data.get(CONF_FORCE_UPDATE, False)
+        unique_id = call.data.get(CONF_UNIQUE_ID)
+        friendly_name = call.data.get(ATTR_FRIENDLY_NAME, object_id)
+        friendly_name_template = call.data.get(CONF_FRIENDLY_NAME_TEMPLATE)
+        icon = call.data.get(CONF_ICON)
+        icon_template = call.data.get(CONF_ICON_TEMPLATE)
+        entity_picture = call.data.get(ATTR_ENTITY_PICTURE)
+        entity_picture_template = call.data.get(CONF_ENTITY_PICTURE_TEMPLATE)
+        manual_tracked_entity_ids = call.data.get(CONF_TRACKED_ENTITY_ID, [])
+        tracked_event_types = call.data.get(CONF_TRACKED_EVENT_TYPE, [])
+
+        # Check if the variable already exists
+        if hass.states.get(f"{DOMAIN}.{object_id}"):
+            _LOGGER.error(f"Variable {object_id} already exists")
+            return
+
+        for template in (value_template, icon_template, entity_picture_template, friendly_name_template):
+            if template is not None:
+                template.hass = hass
+
+        if attributes:
+            for key in attributes:
+                if attributes[key] is not None:
+                    attributes[key].hass = hass
+
+        tracked_entity_ids = list(set(manual_tracked_entity_ids))
+
+        if tracked_event_types is not None:
+            tracked_event_types = list(set(tracked_event_types))
+
+        session = hass.data[recorder.DATA_INSTANCE].get_session()
+
+        entity = Variable(
+            hass,
+            object_id,
+            unique_id,
+            initial_value,
+            value_template,
+            attributes,
+            session,
+            query,
+            column,
+            unit,
+            restore,
+            force_update,
+            friendly_name,
+            friendly_name_template,
+            icon,
+            icon_template,
+            entity_picture,
+            entity_picture_template,
+            tracked_entity_ids,
+            tracked_event_types,
+        )
+
+        if not entity:
+            return False
+
+        component = EntityComponent(_LOGGER, DOMAIN, hass)
+        await component.async_add_entities([entity])
+        await _add_variable_to_yaml(entity, config_file_path)
+        return True
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_ADD, handle_add_variable, schema=SERVICE_ADD_SCHEMA
+    )
+
     return True
 
 async def _load_from_config(hass, config, component):
     entities = []
 
-    for object_id, cfg in config[DOMAIN].items():
+    for object_id, cfg in config.items():
         if not cfg:
             cfg = {}
 
@@ -221,6 +320,22 @@ async def _load_from_config(hass, config, component):
 
     await component.async_add_entities(entities)
     return True
+
+async def _load_yaml(file_path):
+    """Load yaml from given path and return dictionary"""
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as file:
+            config = yaml.safe_load(file) or []
+        return config
+    return []
+
+async def _add_variable_to_yaml(variable, config_file_path):
+    """Adds the variable parameter to the config yaml file"""
+    if os.path.exists(config_file_path):
+        with open(config_file_path, 'a') as file:
+            yaml.dump(variable._get_var_dict(), file, default_flow_style=False)
+        return True
+    return False
 
 class Variable(RestoreEntity):
     """Representation of a variable."""
@@ -329,7 +444,7 @@ class Variable(RestoreEntity):
     def should_poll(self):
         """If entity should be polled."""
         return False
-    
+
     @property
     def force_update(self):
         """Return True if state updates should be forced.
@@ -510,7 +625,7 @@ class Variable(RestoreEntity):
                 except AttributeError:
                     _LOGGER.error('Could not render %s template %s: %s',
                                   friendly_property_name, self._friendly_name, ex)
-        
+
         # Update additional attributes:
         if self._attribute_templates:
             for attr, template in self._attribute_templates.items():
@@ -523,7 +638,7 @@ class Variable(RestoreEntity):
                         rendered_template = template.async_render_with_possible_json_value(db_value, None)
                     else:
                         rendered_template = template.async_render()
-                        
+
                     if rendered_template is not None:
                         self._attr_extra_state_attributes[attr] = rendered_template
                 except TemplateError as ex:
@@ -535,3 +650,25 @@ class Variable(RestoreEntity):
                                         ' the state is unknown.',
                                         friendly_property_name, self._friendly_name)
                         continue
+
+    def _get_var_dict(self) -> dict:
+        properties = {
+            CONF_UNIQUE_ID: self._attr_unique_id,
+            ATTR_FRIENDLY_NAME: self._friendly_name,
+            CONF_FRIENDLY_NAME_TEMPLATE: self._friendly_name_template,
+            CONF_INITIAL_VALUE: self._initial_value,
+            CONF_VALUE_TEMPLATE: self._value_template,
+            CONF_ATTRIBUTES: self._attribute_templates,
+            CONF_TRACKED_ENTITY_ID: self._tracked_entity_ids,
+            CONF_TRACKED_EVENT_TYPE: self._tracked_event_types,
+            CONF_QUERY: self._query,
+            CONF_COLUMN: self._column,
+            CONF_RESTORE: self._restore,
+            CONF_FORCE_UPDATE: self._force_update,
+            ATTR_UNIT_OF_MEASUREMENT: self._unit,
+            CONF_ICON: self._icon,
+            CONF_ICON_TEMPLATE: self._icon_template,
+            ATTR_ENTITY_PICTURE: self._entity_picture,
+            CONF_ENTITY_PICTURE_TEMPLATE: self._entity_picture_template,
+        }
+        return {self.entity_id: {k: v for k, v in properties.items() if v is not None}}
