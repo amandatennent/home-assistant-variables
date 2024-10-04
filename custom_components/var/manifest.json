@@ -1,8 +1,10 @@
 {
   "domain": "var",
   "name": "Variable",
-  "documentation": "https://github.com/snarky-snark/home-assistant-variables/blob/master/README.md",
-  "dependencies": ["recorder"],
   "codeowners": ["@snarky-snark"],
-  "requirements": []
+  "dependencies": ["recorder"],
+  "documentation": "https://github.com/amandatennent/home-assistant-variables/blob/develop/README.md",
+  "iot_class": "calculated",
+  "requirements": [],
+  "version": "0.15.5"
 }
